@@ -9,7 +9,7 @@ cran_packages <- c(
   "httr", "jsonlite", "webchem", "pheatmap", "tibble",
   "stringr", "parallel", "pbmcapply", "furrr", "progressr",
   "ggplot2", "dplyr", "rlang",
-  "writexl", "readr","outliers"
+  "writexl", "readr","outliers", "scales"
 )
 
 # Get installed packages once
@@ -418,5 +418,96 @@ toxify_t_stat <- function(df, direction = c("UP", "DOWN"),
   }
   
   df
+}
+
+
+plot_tox_heatmap_all <- function(df,
+                                 title    = "Compound Toxicity Summary",
+                                 subtitle = "T-score heatmap (relative to Vehicle)",
+                                 limits   = c(0, 30),
+                                 breaks   = c(0, 5, 30),
+                                 palette  = c("#91bfdb", "white", "#d73027"),
+                                 desired_rows = NULL,
+                                 show_text = TRUE,
+                                 text_digits = 2) {
+  
+  if (!("Compound" %in% names(df))) stop("plot_tox_heatmap_all: df must have a 'Compound' column.")
+  
+  heat_df <- df %>%
+    dplyr::rename(RowKey = Compound) %>%
+    tidyr::pivot_longer(
+      cols = -RowKey,
+      names_to  = "AssayLabel",
+      values_to = "Value"
+    ) %>%
+    dplyr::mutate(
+      AssayLabel = stringr::str_replace_all(AssayLabel, "\\s+", " "),
+      AssayLabel = stringr::str_replace_all(AssayLabel, "\\( ", "("),
+      AssayLabel = stringr::str_replace_all(AssayLabel, " \\)", ")")
+    )
+  
+  # Optional row ordering
+  if (!is.null(desired_rows)) {
+    row_levels <- c(
+      desired_rows[desired_rows %in% heat_df$RowKey],
+      setdiff(unique(heat_df$RowKey), desired_rows)
+    )
+  } else {
+    row_levels <- unique(heat_df$RowKey)
+  }
+  
+  all_assays <- unique(heat_df$AssayLabel)
+  
+  plot_df <- heat_df %>%
+    dplyr::mutate(
+      RowKey     = factor(RowKey, levels = row_levels),
+      AssayLabel = factor(AssayLabel, levels = all_assays)
+    )
+  
+  # Guardrails
+  if (length(limits) != 2 || any(is.na(limits))) stop("limits must be c(min,max).")
+  if (length(breaks) < 2 || any(is.na(breaks))) stop("breaks must be numeric vector, e.g. c(0,5,30).")
+  if (min(breaks) < limits[1] || max(breaks) > limits[2]) {
+    # it's okay, but rescale will still work; just warn
+    message("Note: breaks extend outside limits; values will be squished to limits.")
+  }
+  
+  p <- ggplot2::ggplot(plot_df, ggplot2::aes(x = AssayLabel, y = RowKey, fill = Value)) +
+    ggplot2::geom_tile(color = "#1e1e1e", linewidth = 0.2)
+  
+  if (show_text) {
+    fmt <- paste0("%.", text_digits, "f")
+    p <- p + ggplot2::geom_text(
+      ggplot2::aes(label = sprintf(fmt, Value)),
+      size = 3, colour = "black"
+    )
+  }
+  
+  p <- p +
+    ggplot2::scale_fill_gradientn(
+      colours = palette,
+      values  = scales::rescale(breaks),
+      limits  = limits,
+      oob     = scales::squish,
+      name    = "T-score"
+    ) +
+    ggplot2::coord_fixed(ratio = 0.7) +
+    ggplot2::labs(
+      x = NULL, y = NULL,
+      title = title,
+      subtitle = subtitle
+    ) +
+    ggplot2::theme_minimal(base_size = 12) +
+    ggplot2::theme(
+      panel.grid   = ggplot2::element_blank(),
+      axis.text.x  = ggplot2::element_text(angle = 45, vjust = 1, hjust = 1, size = 11),
+      axis.text.y  = ggplot2::element_text(size = 9),
+      plot.title   = ggplot2::element_text(face = "bold", size = 18, colour = "#6b46c1"),
+      legend.title = ggplot2::element_text(face = "bold"),
+      legend.text  = ggplot2::element_text(size = 10),
+      plot.margin  = ggplot2::margin(10, 16, 10, 10)
+    )
+  
+  p
 }
 

@@ -325,7 +325,4 @@ if (do_batch == "Y") {
   } # end else (assays selected)
 }   # end if do_batch == "Y"
 
-
-
-
     
