@@ -1,0 +1,576 @@
+---
+title: "Documentation of DILI Scoring System"
+output:
+  pdf_document: default
+  word_document: default
+  author: Haochen Li
+date: "2026-01-07"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(eval = FALSE)
+```
+
+# Overview
+
+## Background and Motivation 
+Prior to this work, DILI assessment relied heavily on subjective interpretation, particularly through manual inspection of data visualizations such as histograms. This approach has several limitations:
+
+1. High subjectivity\
+Histogram construction (e.g., binning strategy) is inherently subjective and sensitive to experimental variance, which can substantially influence interpretation.
+
+2. Limited comparability across compounds\
+When toxicity differences between compounds are subtle, it becomes difficult to make clear, quantitative comparisons using individual assay readouts or visual inspection alone.
+
+3. Over-reliance on individual concentration levels\
+In conventional analyses, concentration levels that do not reach statistical significance are often excluded, unless a strong overall dose-dependent trend is observed. As a result, potentially informative signals may be overlooked.
+
+## Objective
+
+This code is designed to construct and evaluate a DILI scoring system based on organchip experimental data, with the goal of providing a quantitative and comparable assessment of compound-level hepatotoxic risk.
+
+Specifically, the system takes multiple biological assay readouts as inputs—including but not limited to cell viability, albumin, ATP, and enzymatic markers—measured across different treatment conditions and concentration levels. These data are systematically integrated, normalized, and transformed to produce interpretable compound-level DILI scores.
+
+The resulting scores can be used to:
+
+- Rank and compare hepatotoxic risk across compounds;
+
+- Assess toxicity differences under different treatment conditions or experimental setups;
+
+- Evaluate consistency and reproducibility across experimental batches or laboratories.
+
+
+```{r}
+## ===============================
+## Package installation & loading
+## This step is to load all the necessary packages for future code
+## ===============================
+
+# CRAN packages
+cran_packages <- c(
+  "arrow", "tidyr", "purrr", "readr", "igraph", "readxl",
+  "httr", "jsonlite", "webchem", "pheatmap", "tibble",
+  "stringr", "parallel", "pbmcapply", "furrr", "progressr",
+  "ggplot2", "dplyr", "rlang"
+)
+
+# Get installed packages once
+installed_pkgs <- rownames(installed.packages())
+
+# Install missing CRAN packages
+cran_to_install <- setdiff(cran_packages, installed_pkgs)
+
+if (length(cran_to_install) > 0) {
+  install.packages(cran_to_install, dependencies = TRUE)
+}
+
+# Load all packages
+invisible(
+  lapply(cran_packages, library, character.only = TRUE)
+)
+
+```
+
+
+```{r}
+library(arrow)
+library(tidyr)
+library(purrr)
+library(readr)
+library(igraph)
+library(biomaRt)
+library(readxl)
+library(httr)
+library(jsonlite)
+library(webchem)
+library(pheatmap)
+library(tibble)
+library(clusterProfiler)
+library(ReactomePA)
+library(org.Hs.eg.db)
+library(stringr)
+library(parallel)
+library(pbmcapply)
+library(furrr)
+library(progressr)
+library(ggplot2)
+library(dplyr)
+```
+
+```{r}
+
+
+#Load the data(make sure all the column names match the sample data)
+# Make sure this Rmarkdown file is under the same folder as the data we want to analyse
+raw_data <- read_xlsx("Data_example_2.xlsx")
+
+
+raw_data <- raw_data %>%
+# Remove records with invalid or unusable Drug/Code values; update the values inside 
+#  quotes if different naming is used
+  dplyr::filter(!`Drug/Code` %in% c("OF","UF","Bubble","leak", "Pre-treatment")) %>%
+
+#Modify column names for future code
+  dplyr::rename(Drug = `Drug/Code`,
+         Concentration =`Cmax Multiplier`,
+         ALB_CV = `ALB CV`,
+         ALT_CV = `ALT CV`,
+         Viability = `Percent Viability (%)`,
+         Fold_Viability = `Fold Percent Viability`,
+         ALT = `ALT (ng/day/million cells)`,
+         ALB = `Albumin (µg/day/million cells)`)
+raw_data
+
+# Select the column that we care about
+data <- raw_data %>% 
+  dplyr::select(-Type, -Condition, -Donor, -`Cell count`, -`ALB OD1`, -`ALB OD2`
+                , -`ALT OD1`,-`ALT OD2` )
+data
+
+
+
+# Build Treatment column for to seperate drugs with different concentration levels
+data <- data %>%
+  mutate(
+    Drug          = str_trim(Drug),
+    Concentration = str_trim(Concentration),
+
+    # Remove trailing "XCmax" if present
+    conc_clean = if_else(
+      is.na(Concentration), NA_character_,
+      str_trim(str_replace(Concentration, "(?i)\\s*XCmax\\s*$", ""))
+    ),
+
+    # Remove all whitespaces in drug names
+    drug_clean = str_replace_all(Drug, "\\s+", ""),
+
+    # Construct treatment label
+    treatment = case_when(
+      is.na(conc_clean) | conc_clean == "" ~
+        drug_clean,
+
+      `Vehicle control` == "Negative control" ~
+  str_c(
+    drug_clean,
+    paste0(as.numeric(conc_clean) * 100, "%"),
+    sep = "_"
+  ),
+
+      TRUE ~
+        str_c(drug_clean, conc_clean, sep = "_")
+    )
+  ) %>%
+  dplyr::select(-conc_clean, -drug_clean)
+
+
+#Use this code to convert ALB_CV and ALT_CV from percentage strings (e.g., "12%") 
+#to numeric proportions (e.g., 0.12) when needed for downstream calculations
+# data <- data %>%
+#   mutate(
+#     ALB_CV = as.numeric(str_remove(ALB_CV, "%")) / 100,
+#     ALT_CV = as.numeric(str_remove(ALT_CV, "%")) / 100
+#   )
+
+
+#Convert data into numbers for future use
+data <- data %>%
+  mutate(
+    ALB       = suppressWarnings(as.numeric(ALB)),
+    Viability = suppressWarnings(as.numeric(Viability)),
+    ALT = suppressWarnings(as.numeric(ALT)))
+```
+
+
+```{r}
+
+#Use this code to give a general normality check for data, also see how many 
+#replicate each drug has so that we can determine the method of outlier detection we'll use
+normality_results <- data %>%
+  filter(!is.na(ALB)#, !is.na(ALB_CV), ALB_CV <= 0.2
+         , Day !=7) %>%
+  group_by(treatment, Day) %>%
+  summarise(
+    n = n(),
+    p_value = tryCatch(shapiro.test(ALB)$p.value, error = function(e) NA_real_),
+    is_normal = p_value > 0.05
+  )
+
+normality_results
+```
+
+
+```{r}
+#Outlier detection method, it'll detect the sample size and choose the 
+#corresponding method for outlier
+dixon_iter_rm <- function(x, alpha = 0.05, min_n = 3, mad_thresh = 3.5) {
+  n <- length(x)
+  removed <- rep(FALSE, n)
+
+  if (sum(!is.na(x)) < min_n) return(removed)
+
+  if (sum(!is.na(x)) >= 25) {
+    xx  <- x
+    med <- median(xx, na.rm = TRUE)
+    md  <- mad(xx, na.rm = TRUE)
+
+    if (is.na(md) || md == 0) {
+
+      q <- quantile(xx, probs = c(0.25, 0.75), na.rm = TRUE)
+      iqr <- q[2] - q[1]
+      if (is.na(iqr) || iqr == 0) return(removed)
+      removed <- (xx < (q[1] - 1.5 * iqr)) | (xx > (q[2] + 1.5 * iqr))
+    } else {
+      z <- abs(xx - med) / md
+      removed <- z > mad_thresh
+      removed[is.na(removed)] <- FALSE
+    }
+    return(removed)
+  }
+
+  repeat {
+    idx <- which(!removed & !is.na(x))
+    if (length(idx) < min_n) break
+
+    xs <- x[idx]
+
+    tst <- tryCatch(outliers::dixon.test(xs, two.sided = TRUE),
+                    error = function(e) NULL)
+    if (is.null(tst)) break
+
+    if (!is.na(tst$p.value) && tst$p.value < alpha) {
+      alt <- as.character(tst$alternative)
+      if (grepl("lowest|min", alt, ignore.case = TRUE)) {
+        remove_idx <- idx[which.min(xs)]
+      } else if (grepl("highest|max", alt, ignore.case = TRUE)) {
+        remove_idx <- idx[which.max(xs)]
+      } else {
+          break
+      }
+      removed[remove_idx] <- TRUE
+    } else {
+      break
+    }
+  }
+  removed
+}
+```
+
+```{r}
+# Generate cleaned dataset for future use(Outlier removed) 
+data_alb_flagged_14 <- data %>%
+  filter(!is.na(ALB), Day == 14) %>% 
+  #(Add more restriction here if needed, detailed example check below)
+  group_by(treatment) %>%
+  group_modify(~ mutate(.x, dixon_outlier = dixon_iter_rm(.x$ALB))) %>%
+  ungroup()  %>% 
+  #Stop here if you want to check which compound has been labeled as outlier
+  filter(!dixon_outlier) 
+  #This line is to remove those compounds that have been labeled as outleir
+
+
+
+# data_alb_flagged_11 <- data %>%
+#   filter(!is.na(ALB), !is.na(ALB_CV), ALB_CV <= 0.2, Day == 11) %>%
+#   group_by(treatment) %>%
+#   group_modify(~ mutate(.x, dixon_outlier = dixon_iter_rm(.x$ALB))) %>%
+#   ungroup() %>% 
+#   filter(!dixon_outlier)
+
+
+data_alt_flagged <- data %>%
+  filter(!is.na(ALT), Day == 9) %>%
+  group_by(treatment) %>%
+  group_modify(~ mutate(.x, dixon_outlier = dixon_iter_rm(.x$ALT))) %>%
+  ungroup() %>% 
+  filter(!dixon_outlier)
+
+data_atp_flagged <- data %>%
+  filter(!is.na(ATP), Day == 14) %>%
+  group_by(treatment) %>%
+  group_modify(~ mutate(.x, dixon_outlier = dixon_iter_rm(.x$ATP))) %>%
+  ungroup()%>% 
+  filter(!dixon_outlier)
+```
+
+```{r}
+# Function to convert results into wide table
+make_level_wide <- function(df, value_col, prefix) {
+  val_sym <- rlang::sym(value_col)
+
+  df %>%
+    mutate(
+      Compound = sub("_[^_]*$", "", treatment),
+
+      conc_str = sub(".*_", "", treatment),
+
+      conc_num   = suppressWarnings(as.numeric(conc_str)),
+      conc_label = ifelse(is.na(conc_num), "Base", paste0(conc_str, "X"))
+    ) %>%
+    arrange(Compound, conc_num) %>%
+    dplyr::select(Compound, conc_label, value = !!val_sym) %>%
+    tidyr::pivot_wider(
+      names_from   = conc_label,
+      values_from  = value,
+      names_prefix = paste0(prefix, "_"),
+      names_sort   = FALSE
+    )
+}
+
+```
+
+```{r}
+# Function to calculate scores for each treatment
+#input of the function: (name of the data, Variable name)
+#Examples check below
+ratio_overall_by_treatment_ttest <- function(data, response_col) {
+  library(dplyr)
+  library(rlang)
+  library(stringr)
+
+  resp <- ensym(response_col)
+  resp_name <- as_string(resp)
+  data <- data %>%
+    mutate(
+      `Vehicle control` = str_trim(`Vehicle control`),
+      Drug              = str_trim(Drug)
+    )
+
+  out <- data %>%
+    group_by(treatment) %>%
+    group_modify(~{
+      current_treat <- .y$treatment[[1]]
+
+
+      x <- .x[[resp_name]]
+      x <- x[!is.na(x)]
+      n_treat    <- length(x)
+      mean_treat <- if (n_treat > 0) mean(x) else NA_real_
+
+      vc_raw <- unique(str_trim(.x[["Vehicle control"]]))
+      vc_raw <- vc_raw[!is.na(vc_raw)]
+
+  
+      is_control_treat <- (length(vc_raw) == 1 && vc_raw == "Negative control")
+
+
+      vc_name <- if (!is_control_treat) vc_raw[vc_raw != "Negative control"][1] else NA_character_
+
+  
+      ctrl_df <- if (!is_control_treat && !is.na(vc_name)) {
+        data %>%
+          filter(
+            `Vehicle control` == "Negative control",
+            treatment == vc_name
+          )
+      } else {
+        data[0, , drop = FALSE]  
+      }
+
+      ctrl_vals <- ctrl_df[[resp_name]]
+      ctrl_vals <- ctrl_vals[!is.na(ctrl_vals)]
+      n_ctrl    <- length(ctrl_vals)
+      mean_ctrl <- if (n_ctrl > 0) mean(ctrl_vals) else NA_real_
+
+      if (is_control_treat || n_treat < 2 || n_ctrl < 2) {
+        tibble(
+          mean_treat = mean_treat,
+          n_treat    = n_treat,
+          control_name = if (!is_control_treat) {
+            paste0("Vehicle[", vc_name, "]")
+          } else {
+            "Negative control"
+          },
+          !!paste0("mean_", resp_name, "_ctrl") := mean_ctrl,
+          n_ctrl     = n_ctrl,
+          t_stat     = NA_real_,
+          p_value    = NA_real_
+        )
+      } else {
+        tt <- try(stats::t.test(x, ctrl_vals, var.equal = FALSE), silent = TRUE)
+        if (inherits(tt, "try-error")) {
+          tibble(
+            mean_treat = mean_treat,
+            n_treat    = n_treat,
+            control_name = paste0("Vehicle[", vc_name, "]"),
+            !!paste0("mean_", resp_name, "_ctrl") := mean_ctrl,
+            n_ctrl     = n_ctrl,
+            t_stat     = NA_real_,
+            p_value    = NA_real_
+          )
+        } else {
+          tibble(
+            mean_treat = mean_treat,
+            n_treat    = n_treat,
+            control_name = paste0("Vehicle[", vc_name, "]"),
+            !!paste0("mean_", resp_name, "_ctrl") := mean_ctrl,
+            n_ctrl     = n_ctrl,
+            t_stat     = unname(tt$statistic),
+            p_value    = tt$p.value
+          )
+        }
+      }
+    }) %>%
+    ungroup() %>%
+    rename(!!paste0("mean_", resp_name, "_treat") := mean_treat) %>%
+    arrange(treatment) %>% 
+  
+    dplyr::filter(control_name != "Negative control")
+
+  out
+}
+
+```
+
+
+```{r}
+# Functions that we use to reorganize the score table so that it follows an ascending order
+library(dplyr)
+reorder_wide_columns <- function(df) {
+  fixed_cols <- "Compound"
+  data_cols <- setdiff(names(df), fixed_cols)
+  
+  sort_values <- sapply(data_cols, function(x) {
+    val_str <- sub(".*_([0-9.]+)X$", "\\1", x)
+    val_num <- as.numeric(val_str)
+    
+    return(ifelse(is.na(val_num), 0, val_num))
+  })
+  
+  sorted_data_cols <- data_cols[order(sort_values)]
+  
+  df %>%
+    dplyr::select(all_of(fixed_cols), all_of(sorted_data_cols))
+}
+```
+
+```{r}
+alb_ratio_overall_14 <- ratio_overall_by_treatment_ttest(data_alb_flagged_14, "ALB")
+alb_wide_T_14  <- make_level_wide(alb_ratio_overall_14,  "t_stat", "ALB_DAY14")
+
+#If we need the reorganize the table by concentration level:
+#alb_wide_T_14 <-reorder_wide_columns(alb_wide_T_14)
+```
+
+```{r}
+alt_ratio_overall_T <- ratio_overall_by_treatment_ttest(data_alt_flagged, "ALT")
+alt_wide_T  <- make_level_wide(alt_ratio_overall_T,  "t_stat", "ALT")
+```
+
+```{r}
+atp_ratio_overall_T <- ratio_overall_by_treatment_ttest(data_atp_flagged, "ATP")
+atp_wide_T  <- make_level_wide(atp_ratio_overall_T,  "t_stat", "ATP")
+atp_wide_T
+```
+```{r}
+#Combined seperate tables into one table
+combined_wide_T <- alb_wide_T_14 %>%
+  full_join(alt_wide_T, by = "Compound")%>%
+  full_join(atp_wide_T, by = "Compound") 
+# %>% full_join(XXX, by = "Compound") 
+# (Use this line to add any additional table you'd like to combine)
+
+
+
+combined_wide_T
+
+
+
+# library(writexl)
+# write_xlsx(combined_wide_T, "combined_wide.xlsx")
+```
+```{r}
+# Function for generating heatmap
+plot_tox_heatmap_all <- function(df,
+                                 title    = "Treatment-to-Control",
+                                 subtitle = "Sum of Ratios (relative to Vehicle)") {
+
+  heat_df <- df %>%
+    dplyr::rename(RowKey = Compound) %>%
+    tidyr::pivot_longer(
+      cols = -RowKey,
+      names_to  = "AssayLabel",
+      values_to = "Value"
+    ) %>%
+    dplyr::mutate(
+      AssayLabel = stringr::str_replace_all(AssayLabel, "\\s+", " "),
+      AssayLabel = stringr::str_replace_all(AssayLabel, "\\( ", "("),
+      AssayLabel = stringr::str_replace_all(AssayLabel, " \\)", ")")
+    )
+
+  desired_rows <- c("compound 3", "compound 2", "compound 1")
+  row_levels <- c(
+    desired_rows[desired_rows %in% heat_df$RowKey],
+    setdiff(unique(heat_df$RowKey), desired_rows)
+  )
+
+  all_assays <- unique(heat_df$AssayLabel)
+
+  plot_df <- heat_df %>%
+    dplyr::mutate(
+      RowKey     = factor(RowKey, levels = row_levels),
+      AssayLabel = factor(AssayLabel, levels = all_assays)
+    )
+
+  limits <- c(0, 30) #Change the min and the max of the colorbar
+
+
+  
+  p <- ggplot2::ggplot(plot_df, ggplot2::aes(x = AssayLabel, y = RowKey, fill = Value)) +
+    ggplot2::geom_tile(color = "#1e1e1e", linewidth = 0.2) +
+    ggplot2::geom_text(
+      ggplot2::aes(label = sprintf("%.2f", Value)),
+      size = 3, colour = "black"
+    ) +
+    ggplot2::scale_fill_gradientn(
+      colours = c("#91bfdb", "white", "#d73027"),     
+      # Change the color on the heatmap
+      values  = scales::rescale(c(0, 5, 30)),         
+      # Define custom breakpoints so that colors change at specific values 
+      limits  = limits,
+      oob     = scales::squish,
+      name    = "T-score"
+    ) +
+    ggplot2::coord_fixed(ratio = 0.7) +
+    ggplot2::labs(
+      x = NULL,
+      y = NULL,
+      title    = title,
+      subtitle = subtitle
+    ) +
+    ggplot2::theme_minimal(base_size = 12) +
+    ggplot2::theme(
+      panel.grid   = ggplot2::element_blank(),
+      axis.text.x  = ggplot2::element_text(angle = 45, vjust = 1, hjust = 1, size = 11),
+      axis.text.y  = ggplot2::element_text(size = 9),
+      plot.title   = ggplot2::element_text(face = "bold", size = 18, colour = "#6b46c1"),
+      legend.title = ggplot2::element_text(face = "bold"),
+      legend.text  = ggplot2::element_text(size = 10),
+      plot.margin  = ggplot2::margin(10, 16, 10, 10)
+    )
+
+  return(p)
+}
+
+
+```
+
+```{r}
+# Load data for heatmap
+heatmap <- read_excel("combined_wide.xlsx")
+
+# generate the heatmap
+p<-plot_tox_heatmap_all(heatmap,
+                 title = "Compound Toxicity Summary",
+                 subtitle = "Sum of T-Scores (relative to Vehicle)")
+
+# Save the heatmap into JPG file
+ggsave(
+  filename = "Compound_Toxicity_Heatmap.jpg",
+  plot     = p,
+  width    = 10,   
+  height   = 8,     
+  dpi      = 300    
+)
+
+```

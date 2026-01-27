@@ -1,0 +1,11 @@
+# R session files
+.Rhistory
+.RData
+.Rproj.user/
+
+# Output files (usually not versioned)
+output/
+
+# Mac
+.DS_Store
+
