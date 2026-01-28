@@ -10,21 +10,25 @@ source(file.path("R", "functions.R"))
 
 cat("\n=== Heatmap Generator ===\n")
 
-out_dir <- "data_input"
-if (!dir.exists(out_dir)) stop("output/ not found. Run the main pipeline first.")
+in_dir  <- "data_input"
+out_dir <- "output"
 
-# 1) List candidate xlsx files in output/
-xlsx_files <- list.files(out_dir, pattern = "^[^~].*\\.xlsx$", full.names = FALSE)
-if (length(xlsx_files) == 0) stop("No .xlsx found in output/")
+if (!dir.exists(in_dir)) stop("data_input/ not found.")
+if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
 
-cat("\nAvailable Excel files in output/:\n")
+
+# 1) List candidate xlsx files data_input/
+xlsx_files <- list.files(in_dir, pattern = "^[^~].*\\.xlsx$", full.names = FALSE)
+if (length(xlsx_files) == 0) stop("No .xlsx found in data_input/")
+
+cat("\nAvailable Excel files in data_input/:\n")
 print_numbered(xlsx_files)
 
 ans <- trimws(readline("Select file number (default 1): "))
 idx <- if (!nzchar(ans)) 1 else suppressWarnings(as.integer(ans))
 if (is.na(idx) || idx < 1 || idx > length(xlsx_files)) stop("Invalid selection")
 
-xlsx_path <- file.path(out_dir, xlsx_files[idx])
+xlsx_path <- file.path(in_dir, xlsx_files[idx])
 
 # 2) Choose sheet
 sheets <- readxl::excel_sheets(xlsx_path)
