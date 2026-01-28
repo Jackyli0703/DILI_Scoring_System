@@ -40,12 +40,14 @@ In MAC -> Terminal-> Run  "R --vanilla"
 After Entering R: 
 
 setwd("/yourpath/Scoring System Program")
+
 source("run.R")
 
 Follow the interactive prompts to generate toxicity scores for each compound and assay at the selected time points. 
 The results will be saved as Excel files.
 
 After the scoring results are generated and organized in a wide format, run:
+
 source("heatmap.R")
 
 Select the input file and columns interactively, adjust color limits and scaling if needed, 
