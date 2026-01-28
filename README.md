@@ -40,7 +40,7 @@ In MAC -> Terminal-> Run  "R --vanilla"
 After Entering R: 
 
 setwd("/yourpath/Scoring System Program")
-p'l
+
 source("run.R")
 
 Follow the interactive prompts to generate toxicity scores for each compound and assay at the selected time points. 
