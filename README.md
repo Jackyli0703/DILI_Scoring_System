@@ -1,16 +1,9 @@
 ---
 title: "Documentation of DILI Scoring System"
-output:
-  pdf_document: default
-  word_document: default
-  author: Haochen Li
+author: Haochen Li
 date: "2026-01-07"
 ---
 
-```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
-knitr::opts_chunk$set(eval = FALSE)
-```
 
 # Overview
 
@@ -49,4 +42,11 @@ After Entering R:
 setwd("/yourpath/Scoring System Program")
 source("run.R")
 
-Then follow the guild
+Follow the interactive prompts to generate toxicity scores for each compound and assay at the selected time points. 
+The results will be saved as Excel files.
+
+After the scoring results are generated and organized in a wide format, run:
+source("heatmap.R")
+
+Select the input file and columns interactively, adjust color limits and scaling if needed, 
+and the program will generate a toxicity heatmap image saved to the output/ directory.
